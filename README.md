@@ -4,7 +4,8 @@ Facilitates human speech communication with NAO robots
 # Usage
 Requires OpenAI and Google Cloud API keys
 
-Use these directions for Google Cloud key
+Use these directions to get your Google Cloud key:
+
 https://stackoverflow.com/questions/46287267/how-can-i-get-the-file-service-account-json-for-google-translate-api
 
 Once these keys are obtained, they will need to be inserted into chatbot_server.py.
