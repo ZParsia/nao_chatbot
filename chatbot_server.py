@@ -3,11 +3,8 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 #os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/your/credentials.json" # Replace with path to google cloud json
 
 import sounddevice as sd
-from resemblyzer import VoiceEncoder, preprocess_wav
 from scipy.signal import resample
 from pathlib import Path
-import time
-from google.cloud import speech
 import queue
 import sys
 import time
@@ -24,12 +21,13 @@ from google.cloud import speech
 import pyaudio
 from resemblyzer import VoiceEncoder, preprocess_wav
 from six.moves import queue
+import webrtcvad
 
 
 # --- LLM Initialization ---
 # ChatGPT
 oai_client = OpenAI(
-    api_key = "INSERT KEY HERE"
+    api_key = "INSERT_API_KEY"
 )
 oai_model = "gpt-4"
 
@@ -52,9 +50,9 @@ prompter_system_prompt = ("Your job is to analyze messages that are being sent t
                           "If you find that the message is perfectly coherent and meaningful, reply with only the word 'GOOD'."
                           "If you find that the message has some semblance of meaning, but is a bit messy, you may clean"
                           "up the message to make it more comprehensible. If you choose this option, do not deviate from the original"
-                          "message, only clean up formatting and syntax and such. When you use this option, reply with the word 'EDITED',"
-                          "followed by your edited message.")
-prompter_messages = [{'role': 'system', 'content': prompter_system_prompt}]
+                          "message, only clean up formatting and syntax and such. When you use this option, reply with the word 'EDITED:',"
+                          "followed by your edited message. Edit messages VERY SPARINGLY. Don't guess what a user was trying to say, only make things more readable.")
+prompter_messages = [{'role': 'system', 'content': prompter_system_prompt}, {'role': 'user', 'content': ''}]
 
 
 # --- ZMQ Socket Initialization ---
@@ -83,7 +81,7 @@ def receive_message(socket):
 
 
 # --- Audio Listener Thread ---
-# initalization for resemblyzer listening
+# initialization for resemblyzer and audio streaming
 FS = 16000            # Sample rate
 CHUNK_DURATION = 0.5 # seconds per chunk
 SIMILARITY_THRESHOLD = 0.60
@@ -96,26 +94,49 @@ embeddings = [encoder.embed_utterance(preprocess_wav(Path(p))) for p in REF_PATH
 reference_embed = np.mean(embeddings, axis=0)
 print("✅ Reference loaded.")
 
+vad = webrtcvad.Vad(2)
 
 # stream callback
 def callback(indata, frames, time_info, status):
-    audio = indata[:, 0].flatten()  # mono
-    if np.max(np.abs(audio)) < 0.01:
-        active_speaking.clear()
-        audio_queue.put(np.zeros_like(audio))
-        return  # Skip silence
+    audio = indata[:, 0]
 
-    # Calculate similarity of audio
-    embed = encoder.embed_utterance(audio)
-    similarity = np.dot(reference_embed, embed) / (np.linalg.norm(reference_embed) * np.linalg.norm(embed))
+    # Convert float32 [-1,1] to int16 PCM
+    pcm_int16 = (audio * 32767).astype(np.int16)
+    pcm_bytes = pcm_int16.tobytes()
 
-    if similarity >= SIMILARITY_THRESHOLD:
-        print(f"❌ Match ({similarity:.2f}) — Ignored.")
-        audio_queue.put(np.zeros_like(audio))
+    # Check in 30ms frames
+    frame_duration = 30  # ms
+    frame_length = int(FS * frame_duration / 1000)  # samples per frame
+    frames = [pcm_bytes[i*2*frame_length:(i+1)*2*frame_length] for i in range(len(pcm_bytes)//(2*frame_length))]
+
+    # Basic logic to determine whether the audio has speech or not
+    yes_speaker = 0
+    no_speaker = 0
+    for frame in frames:
+        if vad.is_speech(frame, FS):
+            yes_speaker += 1
+        else:
+            no_speaker += 1
+    if yes_speaker - no_speaker > 0:
+        is_speaker = True
     else:
-        print(f"✅ Not a match ({similarity:.2f}) — Transcribing...")
-        audio_queue.put(audio.copy()) # Sends audio chunks for google cloud transcription
-        active_speaking.set()
+        is_speaker = False
+        active_speaking.clear() # Turns off active_speaking event
+        audio_queue.put(np.zeros_like(audio)) # Sends zeroes to Google Cloud to keep the stream alive
+
+
+    if is_speaker:
+        # Calculate similarity of audio
+        embed = encoder.embed_utterance(audio)
+        similarity = np.dot(reference_embed, embed) / (np.linalg.norm(reference_embed) * np.linalg.norm(embed))
+
+        if similarity >= SIMILARITY_THRESHOLD:
+            print(f"❌ Match ({similarity:.2f}) — Ignored.")
+            audio_queue.put(np.zeros_like(audio))
+        else:
+            print(f"✅ Not a match ({similarity:.2f}) — Transcribing...")
+            audio_queue.put(audio.copy()) # Sends audio chunks for google cloud transcription
+            active_speaking.set()
 
 # Audio thread function
 def record_audio():
@@ -173,16 +194,18 @@ while True:
 
     good_prompt = False
     while not good_prompt:
-        # waiting for human response
-        print("Listening for audio...")
-        while active_speaking.is_set():
-            print("Someone is talking")
-            # Controls how long of a silence to wait for
-            time.sleep(1.5)
 
+        print("Listening for audio...")
         # processes audio chunks from queue
         text_array = []
         while not (transcription_queue.empty() and text_array):
+
+            # Checks if there is active speech and waits for it to end
+            while active_speaking.is_set():
+                print("Someone is talking")
+                # Controls how long of a silence to wait for
+                time.sleep(1.5)
+
             text_array.append(transcription_queue.get())
         print("text_array", text_array)
 
@@ -192,7 +215,7 @@ while True:
         prompt = heard_text
 
         # AI analyzes the prompt to determine whether it is coherent, will make small edits if needed for clarity
-        prompter_messages.append({'role': 'user', 'content': prompt})
+        prompter_messages[1] = {'role': 'user', 'content': prompt}
         prompt_analyzer = oai_client.chat.completions.create(
             messages = prompter_messages,
             model = oai_model
@@ -206,7 +229,7 @@ while True:
             good_prompt = True
         elif prompt_response.startswith('EDITED'):
             print("")
-            prompt = prompt_response.split(" ", 1)[1]
+            prompt = prompt_response.split(":", 1)[1]
             print("Message has been edited to: ", prompt)
             good_prompt = True
 
