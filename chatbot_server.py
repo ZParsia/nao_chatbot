@@ -1,4 +1,6 @@
+from dotenv import load_dotenv
 import os
+load_dotenv()
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 #os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/your/credentials.json" # Replace with path to google cloud json
 
@@ -22,25 +24,35 @@ import pyaudio
 from resemblyzer import VoiceEncoder, preprocess_wav
 from six.moves import queue
 import webrtcvad
-
+import keyboard
 
 # --- LLM Initialization ---
 # ChatGPT
 oai_client = OpenAI(
-    api_key = "INSERT_API_KEY"
+    api_key = os.getenv("OAI_API_KEY")
 )
 oai_model = "gpt-4"
 
 # ollama_model = 'llama3'
 
+animation_list = ["dances/Tai_Chi_Chuan"]
+
+#"dances/Disco"
+#"dances/Headbang"
+
 # System prompt without gestures, telling it about audio recording
 system_prompt = ("You are Journey, a helpful little NAO robot. Do your best to assist the user with their requests. Refrain from using asterisks to denote gestures."
+                 "If you are asked about something personal, like 'How are you?' or 'What's your favorite color?', respond as if you do have feelings and such."
+                 "DO NOT tell the user that you are a robot or an AI and have no feelings."
                  "You are being prompted by audio recordings of human speech, but we may accidentally pick up your"
                  "speech instead. If you find parts of your previous messages in the prompt, ignore it."
                  "If you get a prompt that is completely blank, or only contains parts of your previous message, DO NOT RESPOND."
-                 "In general, keep your responses relatively short, no more than 3 sentences.")
+                 "In general, keep your responses relatively short, no more than 3 sentences."
+                 "As a NAO robot, you are also equipped with a some pre-programmed animations."
+                 "To use the animations, respond with the following format: ^run(insert_animation)."
+                 "Here is your animation list: {a}").format(a=animation_list)
 
-# initalize system prompt
+# initialize system prompt
 messages = [{'role': 'system', 'content': system_prompt}]
 
 # System prompt for prompt analyzer
@@ -70,6 +82,7 @@ transcription_queue = queue.Queue()
 audio_queue = queue.Queue()
 
 
+
 # --- ZMQ Thread ---
 def receive_message(socket):
     try:
@@ -85,7 +98,8 @@ def receive_message(socket):
 FS = 16000            # Sample rate
 CHUNK_DURATION = 0.5 # seconds per chunk
 SIMILARITY_THRESHOLD = 0.60
-REF_PATHS = ["journey1.wav", "journey2.wav", "journey3.wav", "journey4.wav"]
+#REF_PATHS = ["journey1.wav", "journey2.wav", "journey3.wav", "journey4.wav"]
+REF_PATHS = ["journey_mic1.wav", "journey_mic2.wav", "journey_mic3.wav", "journey_mic4.wav"]
 
 # load reference audio file
 print("🔊 Loading reference speaker...")
@@ -131,11 +145,11 @@ def callback(indata, frames, time_info, status):
         similarity = np.dot(reference_embed, embed) / (np.linalg.norm(reference_embed) * np.linalg.norm(embed))
 
         if similarity >= SIMILARITY_THRESHOLD:
-            print(f"❌ Match ({similarity:.2f}) — Ignored.")
+            print(f"❌ Robot Detected ({similarity:.2f}) — Ignored.")
             audio_queue.put(np.zeros_like(audio))
         else:
-            print(f"✅ Not a match ({similarity:.2f}) — Transcribing...")
-            audio_queue.put(audio.copy()) # Sends audio chunks for google cloud transcription
+            print(f"✅ Speaker Detected ({similarity:.2f}) — Transcribing...")
+            audio_queue.put(audio.copy()) # Sends audio chunks for Google Cloud transcription
             active_speaking.set()
 
 # Audio thread function
@@ -162,16 +176,24 @@ def record_audio():
                 continue
 
     print("📝 Starting transcription...")
-    try:
-        responses = client.streaming_recognize(config=streaming_config, requests=request_generator())
-        for response in responses:
-            for result in response.results:
-                transcript = result.alternatives[0].transcript
-                if result.is_final:
-                    print(f"💬 Final: {transcript}")
-                    transcription_queue.put(transcript)
-    except Exception as e:
-        print(f"⚠️ Transcription error: {e}")
+    while True:
+        start_time = time.time()
+        try:
+            requests = request_generator()
+            responses = client.streaming_recognize(config=streaming_config, requests=requests)
+            for response in responses:
+                if time.time() - start_time > 290:
+                    print(f"Restarting transcription stream after {time.time()-start_time} seconds")
+                    break
+
+                for result in response.results:
+                    transcript = result.alternatives[0].transcript
+                    if result.is_final:
+                        print(f"💬 Final: {transcript}")
+                        transcription_queue.put(transcript)
+        except Exception as e:
+            print(f"⚠️ Transcription error: {e}")
+
 
 # start audio listening thread
 print("🎙️ Starting audio stream...")
@@ -186,6 +208,7 @@ audio_stream.start()
 audio_thread = threading.Thread(target=record_audio)
 audio_thread.start()
 
+
 while True:
     # starts zmq thread, waiting for message from client
     zmq_thread = threading.Thread(target=receive_message,args=(socket,))
@@ -199,12 +222,11 @@ while True:
         # processes audio chunks from queue
         text_array = []
         while not (transcription_queue.empty() and text_array):
-
             # Checks if there is active speech and waits for it to end
             while active_speaking.is_set():
                 print("Someone is talking")
                 # Controls how long of a silence to wait for
-                time.sleep(1.5)
+                time.sleep(2)
 
             text_array.append(transcription_queue.get())
         print("text_array", text_array)
@@ -234,7 +256,7 @@ while True:
             good_prompt = True
 
 
-    # prompt ai with the heard message
+    # prompt AI with the heard message
     messages.append({'role': 'user', 'content': prompt})
     print("prompt: ", prompt)
 
@@ -254,10 +276,16 @@ while True:
 
     print("chatting with the AI")
 
-    # gets ai response and adds it to message history
-    response = chat.choices[0].message.content
-    print("RESPONSE: ", response)
-    messages.append({'role': 'assistant', 'content': response})
+    # gets AI response and adds it to message history
+    oai_response = chat.choices[0].message.content
+    print("RESPONSE: ", oai_response)
+
+    messages.append({'role': 'assistant', 'content': oai_response})
+
+    while not transcription_queue.empty():
+        transcription_queue.get()
 
     #  Send reply back to client
-    socket.send_string(response)
+    socket.send_string(oai_response.replace('"',''))
+
+
